@@ -202,8 +202,14 @@ public class RecorderService extends Service {
         try {
             int min = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT);
+            // UNPROCESSED = raw mic: no auto-gain, noise suppression or limiter,
+            // so screams / blowing into the mic aren't ducked. Fall back if unsupported.
+            int source = MediaRecorder.AudioSource.VOICE_RECOGNITION;
+            String prop = getSystemService(android.media.AudioManager.class)
+                    .getProperty(android.media.AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED);
+            if ("true".equals(prop)) source = MediaRecorder.AudioSource.UNPROCESSED;
             AudioRecord r = new AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.MIC)
+                    .setAudioSource(source)
                     .setAudioFormat(new AudioFormat.Builder()
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                             .setSampleRate(SR)
@@ -214,6 +220,19 @@ public class RecorderService extends Service {
                 r.release();
                 return null;
             }
+            // Switch off any processing effects the device attaches anyway.
+            int sid = r.getAudioSessionId();
+            try {
+                if (android.media.audiofx.AutomaticGainControl.isAvailable()) {
+                    android.media.audiofx.AutomaticGainControl.create(sid).setEnabled(false);
+                }
+                if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
+                    android.media.audiofx.NoiseSuppressor.create(sid).setEnabled(false);
+                }
+                if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
+                    android.media.audiofx.AcousticEchoCanceler.create(sid).setEnabled(false);
+                }
+            } catch (Throwable ignored) { }
             return r;
         } catch (Throwable t) {
             return null;
@@ -376,8 +395,15 @@ public class RecorderService extends Service {
                     fm.popMixInto(acc, acc.length);
                     fp.popMixInto(acc, acc.length);
                     for (int k = 0; k < acc.length; k++) {
-                        int v = acc[k];
-                        pcm[k] = (short) (v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+                        // Soft limiter: loud peaks are rounded off instead of hard-clipped,
+                        // and quiet audio is left untouched.
+                        float x = acc[k] / 32768f;
+                        float a = Math.abs(x);
+                        if (a > 0.7f) {
+                            a = 0.7f + 0.3f * (float) Math.tanh((a - 0.7f) / 0.3f);
+                            x = x < 0 ? -a : a;
+                        }
+                        pcm[k] = (short) Math.round(x * 32767f);
                     }
                     long pts = basePtsUs + produced * 1_000_000L / SR;
                     feedAudio(pcm, pcm.length, pts, false);
